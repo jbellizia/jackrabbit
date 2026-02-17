@@ -1,0 +1,45 @@
+
+@import "tailwindcss";
+
+@keyframes spin-slow {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.spin-slow {
+    animation: spin-slow 20s linear infinite;
+}
+
+@layer base {
+    html,
+    body,
+    .inter-font {
+        font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
+        font-weight: 400;
+        font-style: normal;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6 {
+        font-family: 'Oswald', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        font-weight: 600;
+    }
+   
+        
+    input[type="text"],
+    select,
+    input[type="password"],
+    textarea {
+        border: black 1px solid;
+        @apply focus:outline-none focus:ring-1 focus:ring-gray-400 focus:border-gray-400;
+    }
+}
