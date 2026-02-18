@@ -1,8 +1,6 @@
-from flask import Flask, request, jsonify, send_from_directory, redirect
+from flask import Flask, request, jsonify, redirect
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from datetime import datetime
 from dotenv import load_dotenv
 from enum import Enum
 from itsdangerous import URLSafeTimedSerializer
@@ -11,6 +9,9 @@ import uuid
 import sys
 import requests
 from werkzeug.utils import secure_filename
+import psycopg2
+import psycopg2.extras
+
 
 load_dotenv()
 
@@ -18,7 +19,6 @@ app = Flask(__name__)
 
 app.secret_key = os.environ.get("SECRET_KEY")
 
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
 
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
@@ -44,7 +44,7 @@ s = URLSafeTimedSerializer(app.secret_key)
 
 
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", os.getenv("SECRET_KEY"))  
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")  
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 app.config.update(
@@ -106,10 +106,9 @@ def get_db_connection():
         user=os.environ.get("DB_USER"),
         password=os.environ.get("DB_PASS"),
         dbname=os.environ.get("DB_NAME"),
-        port=os.environ.get("PORT"),
+        port=os.environ.get("DB_PORT", 5432),
         cursor_factory=psycopg2.extras.RealDictCursor
     )
-    conn.autocommit = True
     return conn
 
 def init_db():
@@ -119,14 +118,23 @@ def init_db():
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS posts (
                     id SERIAL PRIMARY KEY,
-                    title TEXT,
+                    title TEXT NOT NULL,
                     blurb TEXT,
                     writeup TEXT,
                     media_type TEXT NOT NULL,
                     media_href TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_visible BOOLEAN DEFAULT TRUE
+                    timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    is_visible BOOLEAN DEFAULT TRUE NOT NULL
                 );
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS posts_timestamp_idx
+                ON posts (timestamp DESC);
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS posts_visibility_idx
+                ON posts (is_visible);
             """)
 
             cursor.execute("""
@@ -134,10 +142,10 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     header TEXT,
                     body TEXT,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    last_updated TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-
+            
             cursor.execute("SELECT COUNT(*) FROM about")
             count = cursor.fetchone()["count"]
 
@@ -146,17 +154,16 @@ def init_db():
                     "INSERT INTO about (header, body) VALUES (%s, %s)",
                     ("", "")
                 )
-
+            conn.commit()
     return True
-
 
 init_db()
 
 def get_about():
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, header, body, last_updated FROM about')
-        row = cursor.fetchone()
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT id, header, body, last_updated FROM about')
+            row = cursor.fetchone()
     if row:
         about = About(
             row['id'],
@@ -171,9 +178,9 @@ def get_about():
 
 def get_post_by_id(post_id):
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts WHERE id = %s', (post_id,))
-        row = cursor.fetchone()
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts WHERE id = %s', (post_id,))
+            row = cursor.fetchone()
     if row:
         post = Post(
             row['id'],
@@ -192,9 +199,9 @@ def get_post_by_id(post_id):
 
 def get_all_posts():
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts ORDER BY timestamp DESC')
-        posts = [Post(row['id'], row['title'], row['blurb'], row['writeup'], row['media_type'], row['media_href'], row['timestamp'], row['is_visible']) for row in cursor.fetchall()]
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts ORDER BY timestamp DESC')
+            posts = [Post(row['id'], row['title'], row['blurb'], row['writeup'], row['media_type'], row['media_href'], row['timestamp'], row['is_visible']) for row in cursor.fetchall()]
     return posts
 
 
@@ -279,15 +286,15 @@ def check_auth():
 def create_post():
     data = request.get_json()
 
-    title = data.get('title')
-    blurb = data.get('blurb')
-    writeup = data.get('writeup')
-    media_type = data.get('media_type')
+    title = data.get('title') or None
+    blurb = data.get('blurb') or None
+    writeup = data.get('writeup') or None
+    media_type = data.get('media_type') or None
     # Check for file uploads (image or audio)
-    image_file = data.get('image')
-    audio_file = data.get('audio')
+    image_file = data.get('image') or None
+    audio_file = data.get('audio') or None
     # check if user wants post visible
-    is_visible = data.get('is_visible')
+    is_visible = bool(data.get('is_visible', True))
 
     media_href = None
     saved_file_path = None
@@ -322,13 +329,17 @@ def create_post():
 
     try:
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO posts (title, blurb, writeup, media_type, media_href, is_visible) VALUES (%s,%s,%s,%s,%s,%s)',
-                (title, blurb, writeup, media_type, media_href, is_visible)
-            )
-            conn.commit()
-            new_id = cursor.lastrowid
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    '''
+                    INSERT INTO posts (title, blurb, writeup, media_type, media_href, is_visible)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    ''',
+                    (title, blurb, writeup, media_type, media_href, is_visible)
+                )
+                new_id = cursor.fetchone()["id"]
+                conn.commit()
     except Exception as e:
         # Cleanup saved file if DB insert failed
         try:
@@ -354,48 +365,64 @@ def create_post():
 @login_required
 def update_post(post_id):
     with get_db_connection() as conn:
-        post = get_post_by_id(post_id)
-        if post is None:
-            return jsonify({"error": "Post not found"}), 404
+        with conn.cursor() as cursor:
 
-        data = request.get_json()
+            cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts WHERE id = %s', (post_id,))
+            row = cursor.fetchone()
 
-        title = data.get("title", post.title)
-        blurb = data.get("blurb", post.blurb)
-        writeup = data.get("writeup", post.writeup)
-        media_type = data.get("media_type", post.media_type)
-        media_href = data.get("media_href", post.media_href)
-        is_visible = 1 if data.get("is_visible") else 0
+            if post is None:
+                return jsonify({"error": "Post not found"}), 404
+            
+            if row:
+                post = Post(
+                    row['id'],
+                    row['title'],
+                    row['blurb'],
+                    row['writeup'],
+                    row['media_type'],
+                    row['media_href'],
+                    row['timestamp'],
+                    row['is_visible']
+                )
 
-        old_media_href = post.media_href
 
-        # Delete old media ONLY if it changed
-        if old_media_href and old_media_href != media_href:
-            delete_s3_object_from_url(old_media_href)
+            data = request.get_json()
 
-        cursor = conn.cursor()
-        cursor.execute(
-            '''
-            UPDATE posts
-            SET title=%s,
-                blurb=%s,
-                writeup=%s,
-                media_type=%s,
-                media_href=%s,
-                is_visible=%s
-            WHERE id=%s
-            ''',
-            (
-                title,
-                blurb,
-                writeup,
-                media_type,
-                media_href,
-                is_visible,
-                post_id
+            title = data.get("title", post.title)
+            blurb = data.get("blurb", post.blurb)
+            writeup = data.get("writeup", post.writeup)
+            media_type = data.get("media_type", post.media_type)
+            media_href = data.get("media_href", post.media_href)
+            is_visible = bool(data.get("is_visible", post.is_visible))
+
+            old_media_href = post.media_href
+
+            # Delete old media ONLY if it changed
+            if old_media_href and old_media_href != media_href:
+                delete_s3_object_from_url(old_media_href)
+
+            cursor.execute(
+                '''
+                UPDATE posts
+                SET title=%s,
+                    blurb=%s,
+                    writeup=%s,
+                    media_type=%s,
+                    media_href=%s,
+                    is_visible=%s
+                WHERE id=%s
+                ''',
+                (
+                    title,
+                    blurb,
+                    writeup,
+                    media_type,
+                    media_href,
+                    is_visible,
+                    post_id
+                )
             )
-        )
-        conn.commit()
+            conn.commit()
 
     return jsonify({
         "id": post_id,
@@ -413,24 +440,41 @@ def update_post(post_id):
 @login_required
 def delete_post(post_id):
     with get_db_connection() as conn:
-        post = get_post_by_id(post_id)
-        if not post:
-            return jsonify({"error": "Post not found"}), 404
+        with conn.cursor() as cursor:
+            
+            cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts WHERE id = %s', (post_id,))
+            row = cursor.fetchone()
 
-        # Remove file if exists
-        if post.media_href:
-            # local file stored in /uploads/
-            if post.media_href.startswith('/uploads/'):
-                filename = post.media_href.split('/uploads/')[-1]
-                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-            else:
-                # attempt to delete S3 object if it looks like an S3 URL or key
-                delete_s3_object_from_url(post.media_href)
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM posts WHERE id=%s', (post_id,))
-        conn.commit()
+            if not post:
+                return jsonify({"error": "Post not found"}), 404
+            
+            if row:
+                post = Post(
+                    row['id'],
+                    row['title'],
+                    row['blurb'],
+                    row['writeup'],
+                    row['media_type'],
+                    row['media_href'],
+                    row['timestamp'],
+                    row['is_visible']
+                )
+
+            
+
+            # Remove file if exists
+            if post.media_href:
+                # local file stored in /uploads/
+                if post.media_href.startswith('/uploads/'):
+                    filename = post.media_href.split('/uploads/')[-1]
+                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                else:
+                    # attempt to delete S3 object if it looks like an S3 URL or key
+                    delete_s3_object_from_url(post.media_href)
+            cursor.execute('DELETE FROM posts WHERE id=%s', (post_id,))
+            conn.commit()
 
     return jsonify({"message": "Post deleted"}), 200
 
@@ -528,12 +572,12 @@ def update_about():
         return jsonify({"error": "Missing header or body"}), 400
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE about SET header = %s, body = %s, last_updated = CURRENT_TIMESTAMP WHERE id = 1",
-            (header, body)
-        )
-        conn.commit()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE about SET header = %s, body = %s, last_updated = CURRENT_TIMESTAMP WHERE id = 1",
+                (header, body)
+            )
+            conn.commit()
 
     return jsonify({"message": "About page updated successfully"}), 200
 
