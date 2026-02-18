@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory, redirect
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime
 from dotenv import load_dotenv
@@ -10,16 +11,15 @@ import uuid
 import sys
 import requests
 from werkzeug.utils import secure_filename
-import boto3
-import pymysql
 
-
-s3 = boto3.client("s3")
-
-BUCKET_NAME = "jackrabbitrecords-uploads"
+load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY')
+
+app.secret_key = os.environ.get("SECRET_KEY")
+
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
+
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 
@@ -42,14 +42,11 @@ login_manager.init_app(app)
 
 s = URLSafeTimedSerializer(app.secret_key)
 
-DB_HOST = os.getenv("DB_HOST")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
-DB_NAME = os.getenv("DB_NAME")
 
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", os.getenv("SECRET_KEY"))  
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
 app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=False,   # must be False for local http dev
@@ -103,98 +100,55 @@ def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-
-def s3_key_for_filename(filename: str) -> str:
-    """Return the S3 key used for storing uploads."""
-    return f"uploads/{filename}"
-
-
-def upload_fileobj_to_s3(file_storage, filename: str) -> str:
-    """Upload a Werkzeug FileStorage (from request.files) to S3 and return the public URL.
-
-    This sets the object key to `uploads/<filename>` and sets the ContentType from the
-    uploaded file. Returns the HTTPS URL to the object (constructed as the standard
-    s3.amazonaws.com public URL).
-    """
-    key = s3_key_for_filename(filename)
-    # Ensure file pointer is at start
-    try:
-        file_storage.stream.seek(0)
-    except Exception:
-        pass
-    extra_args = {}
-    if getattr(file_storage, 'mimetype', None):
-        extra_args['ContentType'] = file_storage.mimetype
-    # Try to make object publicly readable. If your bucket blocks ACLs, remove ACL.
-    extra_args['ACL'] = 'public-read'
-    s3.upload_fileobj(file_storage.stream, BUCKET_NAME, key)
-    return f"https://{BUCKET_NAME}.s3.amazonaws.com/{key}"
-
-
-def delete_s3_object_from_url(url: str):
-    """Given a URL produced by upload_fileobj_to_s3, delete the corresponding S3 object.
-
-    If the URL doesn't match the expected pattern, the function will try to be tolerant
-    but will silently return if it can't determine a key.
-    """
-    if not url:
-        return
-    prefix = f"https://{BUCKET_NAME}.s3.amazonaws.com/"
-    if url.startswith(prefix):
-        key = url[len(prefix):]
-        try:
-            s3.delete_object(Bucket=BUCKET_NAME, Key=key)
-        except Exception:
-            # swallow errors to avoid crashing the request
-            pass
-    # if url is a bare key (no prefix) - attempt to delete directly
-    elif url.startswith('uploads/'):
-        try:
-            s3.delete_object(Bucket=BUCKET_NAME, Key=url)
-        except Exception:
-            pass
-
-
 def get_db_connection():
-    return pymysql.connect(
+    conn = psycopg2.connect(
         host=os.environ.get("DB_HOST"),
         user=os.environ.get("DB_USER"),
         password=os.environ.get("DB_PASS"),
-        db=os.environ.get("DB_NAME"),
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True
+        dbname=os.environ.get("DB_NAME"),
+        port=os.environ.get("PORT"),
+        cursor_factory=psycopg2.extras.RealDictCursor
     )
+    conn.autocommit = True
+    return conn
 
 def init_db():
-    
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS posts (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                title TEXT,
-                blurb TEXT,
-                writeup TEXT,
-                media_type TEXT NOT NULL,
-                media_href TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_visible TINYINT DEFAULT 1
-            );
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS about (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                header TEXT,
-                body TEXT,
-                last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        ''')
-        conn.commit()
-        cursor.execute("SELECT COUNT(*) AS count FROM about")
-        count = cursor.fetchone()['count']
-        if count == 0:
-            cursor.execute("INSERT INTO about (header, body) VALUES ('', '')")
+        with conn.cursor() as cursor:
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT,
+                    blurb TEXT,
+                    writeup TEXT,
+                    media_type TEXT NOT NULL,
+                    media_href TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_visible BOOLEAN DEFAULT TRUE
+                );
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS about (
+                    id SERIAL PRIMARY KEY,
+                    header TEXT,
+                    body TEXT,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            cursor.execute("SELECT COUNT(*) FROM about")
+            count = cursor.fetchone()["count"]
+
+            if count == 0:
+                cursor.execute(
+                    "INSERT INTO about (header, body) VALUES (%s, %s)",
+                    ("", "")
+                )
+
     return True
+
 
 init_db()
 

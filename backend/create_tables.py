@@ -4,7 +4,7 @@ import pymysql
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
-DB_NAME = os.getenv("DB_NAME", "jackrabbitrecords")  # default DB name
+DB_NAME = os.getenv("DB_NAME", "jackrabbit")
 
 def get_conn(database=None):
     """Return a pymysql connection to a given database (or no database)."""
