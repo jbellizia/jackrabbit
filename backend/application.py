@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, send_from_directory
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -23,7 +23,8 @@ app.secret_key = os.environ.get("SECRET_KEY")
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 
-UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'mp3', 'wav', 'ogg'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
@@ -31,7 +32,10 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["https://jackrabbitrecords.net", "https://www.jackrabbitrecords.net"],
+        "origins": [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173"
+        ],
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"]
     }
@@ -204,40 +208,16 @@ def get_all_posts():
             posts = [Post(row['id'], row['title'], row['blurb'], row['writeup'], row['media_type'], row['media_href'], row['timestamp'], row['is_visible']) for row in cursor.fetchall()]
     return posts
 
+def parse_bool(value, default=True):
+    if value is None:
+        return default
+    return str(value).lower() in ("true", "1", "yes", "on")
 
 @login_manager.user_loader
 def load_user(user_id):
     if user_id == '1':
         return Admin()
     return None
-
-@app.route("/api/uploads/presign", methods=["POST"])
-def presign_upload():
-    data = request.json
-
-    content_type = data["content_type"]
-    file_ext = data["file_ext"]  # "png", "jpg", "mp3", etc
-
-    key = f"uploads/{uuid.uuid4().hex}.{file_ext}"
-
-    try:
-        url = s3.generate_presigned_url(
-            ClientMethod="put_object",
-            Params={
-                "Bucket": BUCKET_NAME,
-                "Key": key,
-                "ContentType": content_type
-            },
-            ExpiresIn=300  # 5 minutes
-        )
-    except ClientError:
-        return jsonify({"error": "Failed to generate upload URL"}), 500
-
-    return jsonify({
-        "upload_url": url,
-        "public_url": f"https://{BUCKET_NAME}.s3.amazonaws.com/{key}"
-    })
-
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -256,6 +236,11 @@ def login():
 def logout():
     logout_user()
     return jsonify({"message": "Logged out"})
+
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
 
 @app.route('/api/posts', methods=['GET'])
 def get_posts():
@@ -284,37 +269,54 @@ def check_auth():
 @app.route('/api/posts', methods=['POST'])
 @login_required
 def create_post():
-    data = request.get_json()
+    data = request.form
+    files = request.files
 
     title = data.get('title') or None
     blurb = data.get('blurb') or None
     writeup = data.get('writeup') or None
     media_type = data.get('media_type') or None
     # Check for file uploads (image or audio)
-    image_file = data.get('image') or None
-    audio_file = data.get('audio') or None
+    image_file = files.get('image') or None
+    audio_file = files.get('audio') or None
     # check if user wants post visible
-    is_visible = bool(data.get('is_visible', True))
+    is_visible = parse_bool(data.get("is_visible"), True)
+
 
     media_href = None
     saved_file_path = None
     if media_type == 'image' and image_file and allowed_file(image_file.filename):
-        ext = os.path.splitext(secure_filename(image_file.filename))[1]
-        unique_filename = f"{uuid.uuid4().hex}{ext}"
-        # Upload directly to S3 and store the public URL
-        try:
-            media_href = upload_fileobj_to_s3(image_file, unique_filename)
-        except Exception as e:
-            return jsonify({"error": f"Failed to upload file to S3: {str(e)}"}), 500
+        filename = secure_filename(image_file.filename)
+
+        if not allowed_file(filename):
+            return jsonify({"error": "Invalid file type"}), 400
+
+        ext = filename.rsplit('.', 1)[1].lower()
+        filename = f"{uuid.uuid4().hex}.{ext}"
+
+        filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        image_file.save(filepath)
+        saved_file_path = filepath
+
+        media_type = 'image'
+        media_href = f"http://localhost:5050/uploads/{filename}"
     elif media_type == 'audio' and audio_file and allowed_file(audio_file.filename):
-        ext = os.path.splitext(secure_filename(audio_file.filename))[1]
-        unique_filename = f"{uuid.uuid4().hex}{ext}"
-        try:
-            media_href = upload_fileobj_to_s3(audio_file, unique_filename)
-        except Exception as e:
-            return jsonify({"error": f"Failed to upload file to S3: {str(e)}"}), 500
+        filename = secure_filename(audio_file.filename)
+
+        if not allowed_file(filename):
+            return jsonify({"error": "Invalid file type"}), 400
+
+        ext = filename.rsplit('.', 1)[1].lower()
+        filename = f"{uuid.uuid4().hex}.{ext}"
+
+        filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        audio_file.save(filepath)
+        saved_file_path = filepath
+
+        media_type = 'audio'
+        media_href = f"http://localhost:5050/uploads/{filename}"
     else:
-        # maybe user sent a video URL or external media href
+        media_type = data.get('media_type')
         media_href = data.get('media_href')
 
     # validate
@@ -341,13 +343,6 @@ def create_post():
                 new_id = cursor.fetchone()["id"]
                 conn.commit()
     except Exception as e:
-        # Cleanup saved file if DB insert failed
-        try:
-            # if we uploaded to s3, attempt to delete that object
-            if media_href and media_href.startswith(f"https://{BUCKET_NAME}.s3.amazonaws.com/"):
-                delete_s3_object_from_url(media_href)
-        except Exception:
-            pass
         return jsonify({"error": f"Failed to create post: {str(e)}"}), 500
 
     return jsonify({
@@ -370,7 +365,7 @@ def update_post(post_id):
             cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts WHERE id = %s', (post_id,))
             row = cursor.fetchone()
 
-            if post is None:
+            if row is None:
                 return jsonify({"error": "Post not found"}), 404
             
             if row:
@@ -393,13 +388,18 @@ def update_post(post_id):
             writeup = data.get("writeup", post.writeup)
             media_type = data.get("media_type", post.media_type)
             media_href = data.get("media_href", post.media_href)
-            is_visible = bool(data.get("is_visible", post.is_visible))
+            is_visible = parse_bool(data.get("is_visible"), True)
 
             old_media_href = post.media_href
 
             # Delete old media ONLY if it changed
-            if old_media_href and old_media_href != media_href:
-                delete_s3_object_from_url(old_media_href)
+            if old_media_href and old_media_href.startswith("/uploads/") and old_media_href != media_href:
+                try:
+                    filepath = os.path.join(app.config["UPLOAD_FOLDER"], old_media_href.split("/")[-1])
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception as e:
+                    print("File delete error:", e)
 
             cursor.execute(
                 '''
@@ -445,7 +445,7 @@ def delete_post(post_id):
             cursor.execute('SELECT id, title, blurb, writeup, media_type, media_href, timestamp, is_visible FROM posts WHERE id = %s', (post_id,))
             row = cursor.fetchone()
 
-            if not post:
+            if row is None:
                 return jsonify({"error": "Post not found"}), 404
             
             if row:
@@ -463,28 +463,17 @@ def delete_post(post_id):
             
 
             # Remove file if exists
-            if post.media_href:
-                # local file stored in /uploads/
-                if post.media_href.startswith('/uploads/'):
-                    filename = post.media_href.split('/uploads/')[-1]
-                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            if post.media_href and post.media_href.startswith("/uploads/"):
+                try:
+                    filepath = os.path.join(app.config["UPLOAD_FOLDER"], post.media_href.split("/")[-1])
                     if os.path.exists(filepath):
                         os.remove(filepath)
-                else:
-                    # attempt to delete S3 object if it looks like an S3 URL or key
-                    delete_s3_object_from_url(post.media_href)
+                except Exception as e:
+                    print("File delete error:", e)
             cursor.execute('DELETE FROM posts WHERE id=%s', (post_id,))
             conn.commit()
 
     return jsonify({"message": "Post deleted"}), 200
-
-@app.route("/api/uploads/<filename>")
-def uploaded_file(filename):
-    # Redirect to S3 directly
-    s3_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/uploads/{filename}"
-    return redirect(s3_url)
-
-
 
 
 # Get API key from environment variable
@@ -544,6 +533,7 @@ def check_youtube_embed():
         print("Error in check_youtube_embed:", str(e), file=sys.stderr)
         return jsonify({"embeddable": False, "error": str(e)}), 500
 
+
 @app.route("/api/about", methods=["GET"])
 def about():
     about = get_about()
@@ -563,6 +553,7 @@ def about():
         }), 404
 
 @app.route("/api/about", methods=["POST", "PUT"])
+@login_required
 def update_about():
     data = request.get_json()
     header = data.get("header")
